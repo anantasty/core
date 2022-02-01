@@ -2,6 +2,7 @@ package mux
 
 import (
 	"bytes"
+	"context"
 	"crypto/cipher"
 	"crypto/ed25519"
 	"errors"
@@ -264,6 +265,22 @@ func (m *Mux) DialStream() (*Stream, error) {
 	return s, nil
 }
 
+// DialStreamContext creates a new stream with the provided context.
+//
+// Unlike e.g. net.Dial, this does not perform any I/O; the peer will not be
+// aware of the new Stream until Write is called.
+func (m *Mux) DialStreamContext(ctx context.Context) (*Stream, error) {
+	s, err := m.DialStream()
+	if err != nil {
+		return nil, err
+	}
+	go func() {
+		<-ctx.Done()
+		s.closeWithErr(ctx.Err())
+	}()
+	return s, nil
+}
+
 // newMux initializes a Mux and spawns its readLoop and writeLoop goroutines.
 func newMux(conn net.Conn, aead cipher.AEAD, settings connSettings) *Mux {
 	m := &Mux{
@@ -475,8 +492,9 @@ func (s *Stream) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Close closes the Stream. The underlying connection is not closed.
-func (s *Stream) Close() error {
+// closeWithErr closes the stream with the provided error. The underlying
+// connection is not closed.
+func (s *Stream) closeWithErr(err error) error {
 	// cancel outstanding Read/Write calls
 	//
 	// NOTE: Read calls will be interrupted immediately, but Write calls might
@@ -486,8 +504,9 @@ func (s *Stream) Close() error {
 	if s.err == ErrClosedStream {
 		s.cond.L.Unlock()
 		return nil
+	} else if s.err == nil {
+		s.err = err
 	}
-	s.err = ErrClosedStream
 	s.cond.Broadcast()
 	s.cond.L.Unlock()
 
@@ -495,7 +514,7 @@ func (s *Stream) Close() error {
 		id:    s.id,
 		flags: flagLast,
 	}
-	err := s.m.bufferFrame(h, nil, s.wd)
+	err = s.m.bufferFrame(h, nil, s.wd)
 	if err != nil && err != ErrPeerClosedStream {
 		return err
 	}
@@ -505,6 +524,11 @@ func (s *Stream) Close() error {
 	delete(s.m.streams, s.id)
 	s.m.mu.Unlock()
 	return nil
+}
+
+// Close closes the Stream. The underlying connection is not closed.
+func (s *Stream) Close() error {
+	return s.closeWithErr(ErrClosedStream)
 }
 
 var _ net.Conn = (*Stream)(nil)
